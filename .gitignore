@@ -1,0 +1,22 @@
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Arduino build files
+*.hex
+*.elf
+*.bin
+*.eep
+*.map
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# VS Code settings
+.vscode/
+
+# Arduino cache/build folders
+build/
+.cache/
