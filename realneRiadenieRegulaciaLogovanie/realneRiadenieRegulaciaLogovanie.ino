@@ -6,6 +6,8 @@
 
 MS5837 sensor;
 float depth_real = 0.0f;
+float depth_offset = 0.0f;
+bool hladinaVynulovana = false;
 
 // ================================================================
 // ROV – ALL-IN-ONE
@@ -290,7 +292,7 @@ void riadStepperAutoPI() {
     lastRegMs = nowMs;
 
     sensor.read();
-    depth_real = sensor.depth();
+    depth_real = sensor.depth() - depth_offset;
     float e = depth_ref - depth_real;
 
     if (e > -DEADBAND_DEPTH && e < DEADBAND_DEPTH) {
@@ -484,8 +486,16 @@ void aktualizujRezim() {
     if (autoMode) {
       integral_e = 0.0f;
 
+      if (!hladinaVynulovana) {
+        sensor.read();
+        depth_offset = sensor.depth();
+        depth_real = 0.0f;
+        hladinaVynulovana = true;
+        Serial.print("HLADINA VYNULOVANA, offset=");
+        Serial.println(depth_offset, 4);
+      }
+
       if (rozsahOK) {
-        pozicia_kroky = stepsFromVolume(Vpiestu_eq);
         ciel_kroky_reg = pozicia_kroky;
       }
 
@@ -531,8 +541,8 @@ void setup() {
   sensor.setModel(MS5837::MS5837_02BA);
   sensor.setFluidDensity(997); // sladká voda
 
-  //vypisLog();
-  //while(1);
+  vypisLog();
+  while(1);
 }
 
 void loop() {
