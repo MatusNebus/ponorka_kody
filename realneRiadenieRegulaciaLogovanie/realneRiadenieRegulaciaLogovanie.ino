@@ -8,7 +8,7 @@ MS5837 sensor;
 float depth_real = 0.0f;
 float depth_offset = 0.0f;
 bool hladinaVynulovana = false;
-
+//temp znack
 // ================================================================
 // ROV – ALL-IN-ONE
 // CH5 LOW  = manual stepper cez CH3
@@ -28,13 +28,18 @@ bool hladinaVynulovana = false;
 #define ESC_RIGHT_PIN    6
 
 // ---------- LOGOVANIE ----------
+const int LOG_MAGIC_ADDR = 88;
+const int LOG_COUNT_ADDR = 92;
 const int LOG_START_ADDR = 100;   // kde začneme ukladať
 const int LOG_COUNT = 100;        // 200 s / 2 s = 100 vzoriek
+const long LOG_MAGIC = 0x31474F4CL;
 
 int log_index = 0;
+int log_saved_count = 0;
 unsigned long log_start_ms = 0;
 unsigned long log_last_ms = 0;
 bool log_active = false;
+bool log_started = false;
 
 
 // ---------- ESC (mix) ----------
@@ -84,30 +89,12 @@ bool rozsahOK = false;
 PPMReader ppm(PPM_PIN, POCET_KANALOV);
 
 // ================================================================
-// PARAMETRE MODELU PONORKY
-// ================================================================
-const float rho  = 1000.0f;      // kg/m^3
-const float g    = 9.81f;        // m/s^2
-const float b    = 3.0f;         // N*s/m
-
-// ---- Piest ----
-const float Vpiestu_max_ml = 40.0f;
-const float Vpiestu_max    = Vpiestu_max_ml * 1e-6f;   // m^3
-const float Vpiestu_eq     = 20.0e-6f;                 // 20 ml = neutrál
-
-// ---- Ponorka ----
-const float Vpon = 0.003f;       // m^3 (3 litre)
-
-// hmotnosť dopočítaná tak, aby bola neutrál pri 20 ml
-const float m0 = rho * (Vpon - Vpiestu_eq);
-
-// ================================================================
 // PI REGULÁTOR
 // ================================================================
-const float Kp = 0.00018f; //0.00005f;
-const float Ki = 0.0000001f; //0.00000002f;
+const float Kp_steps = 0.45f; // cast rozsahu piestu na 1 m chyby
+const float Ki_steps = 0.05f; // cast rozsahu piestu na 1 m*s integralnej chyby
 
-const float depth_ref = 0.5f;      //ZELANA HLBKA
+const float depth_ref = 0.35f;        //ZELANA HLBKA oooooooooooooooooooooooooooooooooooooooooooo
 const float REG_TS    = 0.10f;     // 100 ms
 const float DEADBAND_DEPTH = 0.05f; // 5 cm
 
@@ -115,10 +102,14 @@ float integral_e = 0.0f;
 
 unsigned long lastRegMs = 0;
 long ciel_kroky_reg = 0;
+long auto_base_kroky = 0;
 
 // prepínanie režimov
 bool autoMode = false;
 bool lastAutoMode = false;
+const unsigned long CH5_DEBOUNCE_MS = 500;
+unsigned long ch5_auto_on_od_ms = 0;
+unsigned long ch5_auto_off_od_ms = 0;
 
 unsigned long lastPrintMs = 0;
 
@@ -248,37 +239,6 @@ void riadESCmix() {
 }
 
 // ================================================================
-// PREVOD KROKY <-> OBJEM
-// ================================================================
-float volumeFromSteps(long steps) {
-  if (!rozsahOK) return Vpiestu_eq;
-
-  long span = max_kroky - min_kroky;
-  if (span <= 0) return Vpiestu_eq;
-
-  float x = (float)(steps - min_kroky) / (float)span;
-  if (x < 0.0f) x = 0.0f;
-  if (x > 1.0f) x = 1.0f;
-
-  return x * Vpiestu_max;
-}
-
-long stepsFromVolume(float V) {
-  if (!rozsahOK) return pozicia_kroky;
-
-  if (V < 0.0f) V = 0.0f;
-  if (V > Vpiestu_max) V = Vpiestu_max;
-
-  float x = V / Vpiestu_max;
-  long steps = min_kroky + (long)(x * (float)(max_kroky - min_kroky));
-
-  if (steps < min_kroky) steps = min_kroky;
-  if (steps > max_kroky) steps = max_kroky;
-
-  return steps;
-}
-
-// ================================================================
 // AUTO PI REGULÁCIA
 // ================================================================
 void riadStepperAutoPI() {
@@ -295,26 +255,29 @@ void riadStepperAutoPI() {
     depth_real = sensor.depth() - depth_offset;
     float e = depth_ref - depth_real;
 
+    long span = max_kroky - min_kroky;
+
     if (e > -DEADBAND_DEPTH && e < DEADBAND_DEPTH) {
-      integral_e = 0.0f; //anti windup
+      integral_e = 0.0f;
+      ciel_kroky_reg = pozicia_kroky;
+    } else {
+      float integral_candidate = integral_e + e * REG_TS;
+
+      float prikaz_rozsahu = Kp_steps * e + Ki_steps * integral_candidate;
+      float ciel_float = (float)auto_base_kroky + prikaz_rozsahu * (float)span;
+
+      if (ciel_float > (float)max_kroky) {
+        ciel_float = (float)max_kroky;
+        if (e < 0.0f) integral_e = integral_candidate;
+      } else if (ciel_float < (float)min_kroky) {
+        ciel_float = (float)min_kroky;
+        if (e > 0.0f) integral_e = integral_candidate;
+      } else {
+        integral_e = integral_candidate;
+      }
+
+      ciel_kroky_reg = (long)ciel_float;
     }
-
-    integral_e += e * REG_TS;
-
-    if (integral_e > 2000.0f) integral_e = 2000.0f;
-    if (integral_e < -2000.0f) integral_e = -2000.0f;
-
-    float u = Kp * e + Ki * integral_e;
-    // 🔴 LIMIT riadiaceho zásahu (kľúčové!)
-    if (u > 10e-6f) u = 10e-6f;
-    if (u < -10e-6f) u = -10e-6f;
-
-
-    float Vtarget = Vpiestu_eq + u;
-    if (Vtarget < 0.0f) Vtarget = 0.0f;
-    if (Vtarget > Vpiestu_max) Vtarget = Vpiestu_max;
-
-    ciel_kroky_reg = stepsFromVolume(Vtarget);
 
     // debug
     if (millis() - lastPrintMs >= 2000) {
@@ -326,12 +289,12 @@ void riadStepperAutoPI() {
       Serial.print(depth_ref, 4);
       Serial.print(", e=");
       Serial.print(e, 4);
-      Serial.print(", V=");
-      Serial.print(volumeFromSteps(pozicia_kroky), 7);
       Serial.print(", pos=");
       Serial.print(pozicia_kroky);
       Serial.print(", tgt=");
-      Serial.println(ciel_kroky_reg);
+      Serial.print(ciel_kroky_reg);
+      Serial.print(", span=");
+      Serial.println(span);
     }
   }
 
@@ -358,8 +321,21 @@ void riadStepperAutoPI() {
 }
 
 void vypisLog() {
+  long log_magic = 0;
+  int count = LOG_COUNT;
+
+  EEPROM.get(LOG_MAGIC_ADDR, log_magic);
+  if (log_magic == LOG_MAGIC) {
+    EEPROM.get(LOG_COUNT_ADDR, count);
+    if (count < 0) count = 0;
+    if (count > LOG_COUNT) count = LOG_COUNT;
+  }
+
   Serial.println("---- LOG ----");
-  for (int i = 0; i < LOG_COUNT; i++) {
+  Serial.print("POCET=");
+  Serial.println(count);
+
+  for (int i = 0; i < count; i++) {
     float h;
     EEPROM.get(LOG_START_ADDR + i * sizeof(float), h);
     Serial.println(h, 4);
@@ -466,20 +442,47 @@ void riadStepperManual() {
 // ================================================================
 void aktualizujRezim() {
   int ch5 = ppm.latestValidChannelValue(5, 1000);
+  unsigned long nowMs = millis();
 
   // 🔴 hysterézia (dve hranice)
   const int AUTO_ON = 1800;   // musí byť fakt hore
   const int AUTO_OFF = 1600;  // musí byť fakt dole
 
-  if (!autoMode && ch5 >= AUTO_ON) {
+  if (ch5 >= AUTO_ON) {
+    if (ch5_auto_on_od_ms == 0) ch5_auto_on_od_ms = nowMs;
+  } else {
+    ch5_auto_on_od_ms = 0;
+  }
+
+  if (ch5 <= AUTO_OFF) {
+    if (ch5_auto_off_od_ms == 0) ch5_auto_off_od_ms = nowMs;
+  } else {
+    ch5_auto_off_od_ms = 0;
+  }
+
+  bool autoOnStable = ch5_auto_on_od_ms != 0 && (unsigned long)(nowMs - ch5_auto_on_od_ms) >= CH5_DEBOUNCE_MS;
+  bool autoOffStable = ch5_auto_off_od_ms != 0 && (unsigned long)(nowMs - ch5_auto_off_od_ms) >= CH5_DEBOUNCE_MS;
+
+  if (!autoMode && autoOnStable) {
     autoMode = true;
-    log_index = 0;
-    log_start_ms = millis();
-    log_last_ms = millis();
-    log_active = true;
+    ch5_auto_on_od_ms = 0;
+    if (!log_started) {
+      log_index = 0;
+      log_saved_count = 0;
+      log_start_ms = millis();
+      log_last_ms = millis();
+      log_active = true;
+      log_started = true;
+      EEPROM.put(LOG_MAGIC_ADDR, LOG_MAGIC);
+      EEPROM.put(LOG_COUNT_ADDR, log_saved_count);
+    } else if (log_index < LOG_COUNT) {
+      log_last_ms = millis();
+      log_active = true;
+    }
   } 
-  else if (autoMode && ch5 <= AUTO_OFF) {
+  else if (autoMode && autoOffStable) {
     autoMode = false;
+    ch5_auto_off_od_ms = 0;
   }
 
   if (autoMode != lastAutoMode) {
@@ -496,6 +499,7 @@ void aktualizujRezim() {
       }
 
       if (rozsahOK) {
+        auto_base_kroky = pozicia_kroky;
         ciel_kroky_reg = pozicia_kroky;
       }
 
@@ -563,6 +567,8 @@ void loop() {
       if (log_index < LOG_COUNT) {
         EEPROM.put(LOG_START_ADDR + log_index * sizeof(float), depth_real);
         log_index++;
+        log_saved_count = log_index;
+        EEPROM.put(LOG_COUNT_ADDR, log_saved_count);
       } else {
         log_active = false;
       }
