@@ -30,6 +30,7 @@ bool hladinaVynulovana = false;
 // ---------- LOGOVANIE ----------
 const int LOG_MAGIC_ADDR = 88;
 const int LOG_COUNT_ADDR = 92;
+const int LOG_WRITE_INDEX_ADDR = 96;
 const int LOG_START_ADDR = 100;   // kde začneme ukladať
 const int LOG_COUNT = 100;        // 200 s / 2 s = 100 vzoriek
 const long LOG_MAGIC = 0x31474F4CL;
@@ -85,6 +86,11 @@ long max_kroky = 0;
 long pozicia_kroky = 0;
 bool rozsahOK = false;
 
+// Softverove rozsirenie rozsahu piestu smerom k MAX.
+// 0.5 cm = 5 mm z celkoveho zdvihu skrutky 80 mm.
+const float STROKE_MM = 80.0f;
+const float EXTRA_MAX_STROKE_MM = 5.0f;
+
 // ---------- PPM ----------
 PPMReader ppm(PPM_PIN, POCET_KANALOV);
 
@@ -92,16 +98,18 @@ PPMReader ppm(PPM_PIN, POCET_KANALOV);
 // PI REGULÁTOR
 // ================================================================
 const float Kp_steps = 1.20f; // cast rozsahu piestu na 1 m chyby
-const float Ki_steps = 0.04f; // cast rozsahu piestu na 1 m*s integralnej chyby
+const float Ki_steps = 0.025f; // cast rozsahu piestu na 1 m*s integralnej chyby
 
 const float depth_ref = 0.35f;        //ZELANA HLBKA oooooooooooooooooooooooooooooooooooooooooooo
 const float REG_TS    = 0.10f;     // 100 ms
-const float DEADBAND_DEPTH = 0.05f; // 5 cm
+const float DEADBAND_DEPTH = 0.01f; // 1 cm
+const float DEADBAND_EXIT_DEPTH = 0.02f; // znovu reguluj az za 2 cm
 
 float integral_e = 0.0f;
 unsigned long lastRegMs = 0;
 long ciel_kroky_reg = 0;
 long auto_base_kroky = 0;
+bool depthHoldPaused = false;
 
 // prepínanie režimov
 bool autoMode = false;
@@ -179,6 +187,10 @@ void nacitajEEPROM() {
     EEPROM.get(EE_DATA_ADDR + (int)sizeof(long), max_kroky);
 
     if (max_kroky > min_kroky + 100) {
+      long span = max_kroky - min_kroky;
+      long extra_max_kroky = (long)((float)span * EXTRA_MAX_STROKE_MM / STROKE_MM);
+      max_kroky += extra_max_kroky;
+
       rozsahOK = true;
       pozicia_kroky = (min_kroky + max_kroky) / 2;
     }
@@ -253,31 +265,44 @@ void riadStepperAutoPI() {
     sensor.read();
     depth_real = sensor.depth() - depth_offset;
     float e = depth_ref - depth_real;
-    float e_control = e;
-    if (e_control > -DEADBAND_DEPTH && e_control < DEADBAND_DEPTH) {
-      e_control = 0.0f;
+
+    float abs_e = e;
+    if (abs_e < 0.0f) abs_e = -abs_e;
+
+    if (depthHoldPaused) {
+      if (abs_e >= DEADBAND_EXIT_DEPTH) {
+        depthHoldPaused = false;
+      }
+    } else if (abs_e <= DEADBAND_DEPTH) {
+      depthHoldPaused = true;
     }
 
-    long span = max_kroky - min_kroky;
-    float integral_candidate = integral_e + e_control * REG_TS;
-    float u = Kp_steps * e_control + Ki_steps * integral_candidate;
-    float ciel_float = (float)auto_base_kroky + u * (float)span;
-
-    if (ciel_float > (float)max_kroky) {
-      ciel_float = (float)max_kroky;
-      if (e_control < 0.0f) {
-        integral_e = integral_candidate;
-      }
-    } else if (ciel_float < (float)min_kroky) {
-      ciel_float = (float)min_kroky;
-      if (e_control > 0.0f) {
-        integral_e = integral_candidate;
-      }
+    if (depthHoldPaused) {
+      ciel_kroky_reg = pozicia_kroky;
     } else {
-      integral_e = integral_candidate;
-    }
+      float e_control = e;
 
-    ciel_kroky_reg = (long)ciel_float;
+      long span = max_kroky - min_kroky;
+      float integral_candidate = integral_e + e_control * REG_TS;
+      float u = Kp_steps * e_control + Ki_steps * integral_candidate;
+      float ciel_float = (float)auto_base_kroky + u * (float)span;
+
+      if (ciel_float > (float)max_kroky) {
+        ciel_float = (float)max_kroky;
+        if (e_control < 0.0f) {
+          integral_e = integral_candidate;
+        }
+      } else if (ciel_float < (float)min_kroky) {
+        ciel_float = (float)min_kroky;
+        if (e_control > 0.0f) {
+          integral_e = integral_candidate;
+        }
+      } else {
+        integral_e = integral_candidate;
+      }
+
+      ciel_kroky_reg = (long)ciel_float;
+    }
 
     // debug
     if (millis() - lastPrintMs >= 2000) {
@@ -294,7 +319,9 @@ void riadStepperAutoPI() {
       Serial.print(", tgt=");
       Serial.print(ciel_kroky_reg);
       Serial.print(", span=");
-      Serial.println(span);
+      Serial.print(max_kroky - min_kroky);
+      Serial.print(", hold=");
+      Serial.println(depthHoldPaused ? 1 : 0);
     }
   }
 
@@ -323,12 +350,16 @@ void riadStepperAutoPI() {
 void vypisLog() {
   long log_magic = 0;
   int count = LOG_COUNT;
+  int write_index = 0;
 
   EEPROM.get(LOG_MAGIC_ADDR, log_magic);
   if (log_magic == LOG_MAGIC) {
     EEPROM.get(LOG_COUNT_ADDR, count);
+    EEPROM.get(LOG_WRITE_INDEX_ADDR, write_index);
     if (count < 0) count = 0;
     if (count > LOG_COUNT) count = LOG_COUNT;
+    if (write_index < 0) write_index = 0;
+    if (write_index >= LOG_COUNT) write_index = 0;
   }
 
   Serial.println("---- LOG ----");
@@ -336,8 +367,13 @@ void vypisLog() {
   Serial.println(count);
 
   for (int i = 0; i < count; i++) {
+    int eeprom_index = i;
+    if (count == LOG_COUNT) {
+      eeprom_index = (write_index + i) % LOG_COUNT;
+    }
+
     float h;
-    EEPROM.get(LOG_START_ADDR + i * sizeof(float), h);
+    EEPROM.get(LOG_START_ADDR + eeprom_index * sizeof(float), h);
     if (i > 0) {
       Serial.print(",");
     }
@@ -479,7 +515,8 @@ void aktualizujRezim() {
       log_started = true;
       EEPROM.put(LOG_MAGIC_ADDR, LOG_MAGIC);
       EEPROM.put(LOG_COUNT_ADDR, log_saved_count);
-    } else if (log_index < LOG_COUNT) {
+      EEPROM.put(LOG_WRITE_INDEX_ADDR, log_index);
+    } else {
       log_last_ms = millis();
       log_active = true;
     }
@@ -492,6 +529,7 @@ void aktualizujRezim() {
   if (autoMode != lastAutoMode) {
     if (autoMode) {
       integral_e = 0.0f;
+      depthHoldPaused = false;
 
       if (!hladinaVynulovana) {
         sensor.read();
@@ -568,14 +606,19 @@ void loop() {
     if (millis() - log_last_ms >= 2000) {
       log_last_ms = millis();
 
-      if (log_index < LOG_COUNT) {
-        EEPROM.put(LOG_START_ADDR + log_index * sizeof(float), depth_real);
-        log_index++;
-        log_saved_count = log_index;
-        EEPROM.put(LOG_COUNT_ADDR, log_saved_count);
-      } else {
-        log_active = false;
+      EEPROM.put(LOG_START_ADDR + log_index * sizeof(float), depth_real);
+
+      log_index++;
+      if (log_index >= LOG_COUNT) {
+        log_index = 0;
       }
+
+      if (log_saved_count < LOG_COUNT) {
+        log_saved_count++;
+      }
+
+      EEPROM.put(LOG_COUNT_ADDR, log_saved_count);
+      EEPROM.put(LOG_WRITE_INDEX_ADDR, log_index);
     }
   }
 }
