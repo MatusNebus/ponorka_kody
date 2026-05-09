@@ -8,7 +8,7 @@ MS5837 sensor;
 float depth_real = 0.0f;
 float depth_offset = 0.0f;
 bool hladinaVynulovana = false;
-//temp znack
+//temp znac
 // ================================================================
 // ROV – ALL-IN-ONE
 // CH5 LOW  = manual stepper cez CH3
@@ -91,15 +91,14 @@ PPMReader ppm(PPM_PIN, POCET_KANALOV);
 // ================================================================
 // PI REGULÁTOR
 // ================================================================
-const float Kp_steps = 0.45f; // cast rozsahu piestu na 1 m chyby
-const float Ki_steps = 0.05f; // cast rozsahu piestu na 1 m*s integralnej chyby
+const float Kp_steps = 1.20f; // cast rozsahu piestu na 1 m chyby
+const float Ki_steps = 0.04f; // cast rozsahu piestu na 1 m*s integralnej chyby
 
 const float depth_ref = 0.35f;        //ZELANA HLBKA oooooooooooooooooooooooooooooooooooooooooooo
 const float REG_TS    = 0.10f;     // 100 ms
 const float DEADBAND_DEPTH = 0.05f; // 5 cm
 
 float integral_e = 0.0f;
-
 unsigned long lastRegMs = 0;
 long ciel_kroky_reg = 0;
 long auto_base_kroky = 0;
@@ -254,30 +253,31 @@ void riadStepperAutoPI() {
     sensor.read();
     depth_real = sensor.depth() - depth_offset;
     float e = depth_ref - depth_real;
+    float e_control = e;
+    if (e_control > -DEADBAND_DEPTH && e_control < DEADBAND_DEPTH) {
+      e_control = 0.0f;
+    }
 
     long span = max_kroky - min_kroky;
+    float integral_candidate = integral_e + e_control * REG_TS;
+    float u = Kp_steps * e_control + Ki_steps * integral_candidate;
+    float ciel_float = (float)auto_base_kroky + u * (float)span;
 
-    if (e > -DEADBAND_DEPTH && e < DEADBAND_DEPTH) {
-      integral_e = 0.0f;
-      ciel_kroky_reg = pozicia_kroky;
-    } else {
-      float integral_candidate = integral_e + e * REG_TS;
-
-      float prikaz_rozsahu = Kp_steps * e + Ki_steps * integral_candidate;
-      float ciel_float = (float)auto_base_kroky + prikaz_rozsahu * (float)span;
-
-      if (ciel_float > (float)max_kroky) {
-        ciel_float = (float)max_kroky;
-        if (e < 0.0f) integral_e = integral_candidate;
-      } else if (ciel_float < (float)min_kroky) {
-        ciel_float = (float)min_kroky;
-        if (e > 0.0f) integral_e = integral_candidate;
-      } else {
+    if (ciel_float > (float)max_kroky) {
+      ciel_float = (float)max_kroky;
+      if (e_control < 0.0f) {
         integral_e = integral_candidate;
       }
-
-      ciel_kroky_reg = (long)ciel_float;
+    } else if (ciel_float < (float)min_kroky) {
+      ciel_float = (float)min_kroky;
+      if (e_control > 0.0f) {
+        integral_e = integral_candidate;
+      }
+    } else {
+      integral_e = integral_candidate;
     }
+
+    ciel_kroky_reg = (long)ciel_float;
 
     // debug
     if (millis() - lastPrintMs >= 2000) {
@@ -338,8 +338,12 @@ void vypisLog() {
   for (int i = 0; i < count; i++) {
     float h;
     EEPROM.get(LOG_START_ADDR + i * sizeof(float), h);
-    Serial.println(h, 4);
+    if (i > 0) {
+      Serial.print(",");
+    }
+    Serial.print(h, 4);
   }
+  Serial.println();
 }
 
 // ---------- STEPPER MANUAL z CH3 ----------
@@ -463,7 +467,7 @@ void aktualizujRezim() {
   bool autoOnStable = ch5_auto_on_od_ms != 0 && (unsigned long)(nowMs - ch5_auto_on_od_ms) >= CH5_DEBOUNCE_MS;
   bool autoOffStable = ch5_auto_off_od_ms != 0 && (unsigned long)(nowMs - ch5_auto_off_od_ms) >= CH5_DEBOUNCE_MS;
 
-  if (!autoMode && autoOnStable) {
+  if (!autoMode && autoOnStable && rozsahOK && zosuladene) {
     autoMode = true;
     ch5_auto_on_od_ms = 0;
     if (!log_started) {
