@@ -8,7 +8,7 @@
 //               Ak je MAX < MIN, automaticky ich prehodí.
 //     "show" -> zobrazí hodnoty z RAM aj EEPROM
 //     "clear"-> zmaže "magic" (ako reset kalibrácie)
-// - Zapojenie: PPM SUM → D3, STEP D12, DIR D13, EN D8 (LOW = enable)
+// - Zapojenie: PPM SUM → D3, STEP D7, DIR D10, EN D8 (LOW = enable)
 // - LED (D5, active-LOW) držíme zhasnutú, ESC piny (D6, D9) ticho
 // ===============================================
 
@@ -18,8 +18,8 @@
 // --- PINY ---
 #define PPM_PIN        3
 #define POCET_KANALOV  8
-#define STEP_PIN      12
-#define DIR_PIN       13
+#define STEP_PIN       7
+#define DIR_PIN       10
 #define EN_PIN         8
 #define LED_PIN_PWM    5   // active-LOW -> 255 = OFF
 #define ESC_PIN_1      6
@@ -30,7 +30,7 @@ const int CH_DOLU_MAX      = 1300;   // ≤ 1300 µs = smer k MIN
 const int CH_STRED_MIN     = 1301;   // 1301..1700 µs = STOP
 const int CH_STRED_MAX     = 1700;   // ≥ 1700 µs = smer k MAX
 const int STEP_PULSE_US    = 3;      // šírka pulzu na STEP
-const int KROK_INTERVAL_US = 1500;   // menšie = rýchlejšie (konštantná rýchlosť)
+const int KROK_INTERVAL_US = 3000;   // menšie = rýchlejšie (konštantná rýchlosť)
 
 // --- EEPROM (adresy + "magic") ---
 const int  EE_MAGIC_ADDR = 0;

@@ -86,11 +86,6 @@ long max_kroky = 0;
 long pozicia_kroky = 0;
 bool rozsahOK = false;
 
-// Softverove rozsirenie rozsahu piestu smerom k MAX.
-// 0.5 cm = 5 mm z celkoveho zdvihu skrutky 80 mm.
-const float STROKE_MM = 80.0f;
-const float EXTRA_MAX_STROKE_MM = 5.0f;
-
 // ---------- PPM ----------
 PPMReader ppm(PPM_PIN, POCET_KANALOV);
 
@@ -187,10 +182,6 @@ void nacitajEEPROM() {
     EEPROM.get(EE_DATA_ADDR + (int)sizeof(long), max_kroky);
 
     if (max_kroky > min_kroky + 100) {
-      long span = max_kroky - min_kroky;
-      long extra_max_kroky = (long)((float)span * EXTRA_MAX_STROKE_MM / STROKE_MM);
-      max_kroky += extra_max_kroky;
-
       rozsahOK = true;
       pozicia_kroky = (min_kroky + max_kroky) / 2;
     }
@@ -587,8 +578,8 @@ void setup() {
   sensor.setModel(MS5837::MS5837_02BA);
   sensor.setFluidDensity(997); // sladká voda
 
-  vypisLog();
-  while(1);
+  //vypisLog();
+  //while(1);
 }
 
 void loop() {
