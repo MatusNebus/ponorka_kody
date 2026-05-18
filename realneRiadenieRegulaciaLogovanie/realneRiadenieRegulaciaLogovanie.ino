@@ -124,10 +124,13 @@ unsigned long lastPrintMs = 0;
 // ---------- iBUS TELEMETRIA ----------
 // 1 = Serial na D0/D1 patri FlySky iBUS telemetrii.
 // 0 = Serial Monitor/debug/log vypisy cez USB.
-#define ENABLE_IBUS_TELEMETRY 0
+#define ENABLE_IBUS_TELEMETRY 1
+#define IBUS_USE_DUMMY_VALUES 1
 
 const unsigned long TELEMETRY_SENSOR_READ_INTERVAL_MS = 1000;
 unsigned long lastTelemetrySensorReadMs = 0;
+const uint8_t IBUS_MAX_BYTES_PER_CALL = 16;
+const unsigned long IBUS_FRAME_GAP_US = 3000;
 
 const uint8_t IBUS_CMD_DISCOVER = 0x80;
 const uint8_t IBUS_CMD_TYPE     = 0x90;
@@ -201,16 +204,32 @@ void citajTlakomer() {
 }
 
 int16_t ibusTeplota() {
+#if IBUS_USE_DUMMY_VALUES
+  return (int16_t)((22.5f + 40.0f) * 10.0f);
+#else
   return (int16_t)((temp_real + 40.0f) * 10.0f);
+#endif
 }
 
 int16_t ibusHlbkaAkoNapatie() {
+#if IBUS_USE_DUMMY_VALUES
+  return (int16_t)(0.42f * 100.0f);
+#else
   float h = depth_real;
   if (h < 0.0f) h = 0.0f;
   return (int16_t)(h * 100.0f);
+#endif
 }
 
 #if ENABLE_IBUS_TELEMETRY
+void ibusAfterResponse() {
+  Serial.flush();
+
+  while (Serial.available() > 0) {
+    Serial.read();
+  }
+}
+
 void ibusWriteChecksum(uint16_t checksum) {
   Serial.write((uint8_t)(checksum & 0xFF));
   Serial.write((uint8_t)(checksum >> 8));
@@ -221,6 +240,7 @@ void ibusSendDiscover(uint8_t adr) {
   Serial.write((uint8_t)0x04);
   Serial.write(cmd);
   ibusWriteChecksum(0xFFFF - 0x04 - cmd);
+  ibusAfterResponse();
 }
 
 void ibusSendType(uint8_t adr, uint8_t sensorType) {
@@ -234,6 +254,7 @@ void ibusSendType(uint8_t adr, uint8_t sensorType) {
   Serial.write(sensorType);
   Serial.write(sensorLen);
   ibusWriteChecksum(checksum);
+  ibusAfterResponse();
 }
 
 void ibusSendValue(uint8_t adr, int16_t value) {
@@ -248,6 +269,7 @@ void ibusSendValue(uint8_t adr, int16_t value) {
   Serial.write(lo);
   Serial.write(hi);
   ibusWriteChecksum(checksum);
+  ibusAfterResponse();
 }
 
 void spracujIbusRequest(uint8_t cmd) {
@@ -268,20 +290,23 @@ void spracujIbusRequest(uint8_t cmd) {
 void obsluzIbusTelemetriu() {
   static uint8_t frame[4];
   static uint8_t pos = 0;
-  static unsigned long lastByteMs = 0;
+  static unsigned long lastByteUs = 0;
+  uint8_t processed = 0;
 
-  while (Serial.available() > 0) {
+  while (Serial.available() > 0 && processed < IBUS_MAX_BYTES_PER_CALL) {
+    processed++;
     uint8_t b = (uint8_t)Serial.read();
-    unsigned long nowMs = millis();
-    bool newFrameGap = (lastByteMs == 0) || ((unsigned long)(nowMs - lastByteMs) >= 3);
+    unsigned long nowUs = micros();
+    bool newFrameGap = (lastByteUs == 0) || ((unsigned long)(nowUs - lastByteUs) >= IBUS_FRAME_GAP_US);
 
     if (newFrameGap) {
       pos = 0;
     }
-    lastByteMs = nowMs;
+    lastByteUs = nowUs;
 
     if (pos == 0) {
       if (!newFrameGap || b != 0x04) {
+        pos = 0;
         continue;
       }
     }
@@ -295,6 +320,8 @@ void obsluzIbusTelemetriu() {
 
       if (frame[0] == 0x04 && receivedChecksum == expectedChecksum) {
         spracujIbusRequest(frame[1]);
+      } else {
+        pos = 0;
       }
     }
   }
@@ -750,14 +777,12 @@ void loop() {
   riadLED();
   riadESCmix();
   aktualizujRezim();
-  obsluzIbusTelemetriu();
 
   if (autoMode) {
     riadStepperAutoPI();
   } else {
     riadStepperManual();
   }
-  obsluzIbusTelemetriu();
 
   if (autoMode && log_active) {
     if (millis() - log_last_ms >= 2000) {
