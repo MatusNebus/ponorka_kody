@@ -7,6 +7,7 @@
 MS5837 sensor;
 float depth_real = 0.0f;
 float depth_offset = 0.0f;
+float temp_real = 0.0f;
 bool hladinaVynulovana = false;
 //temp znac
 // ================================================================
@@ -120,6 +121,21 @@ unsigned long ch5_auto_off_od_ms = 0;
 
 unsigned long lastPrintMs = 0;
 
+// ---------- iBUS TELEMETRIA ----------
+// 1 = Serial na D0/D1 patri FlySky iBUS telemetrii.
+// 0 = Serial Monitor/debug/log vypisy cez USB.
+#define ENABLE_IBUS_TELEMETRY 0
+
+const unsigned long TELEMETRY_SENSOR_READ_INTERVAL_MS = 1000;
+unsigned long lastTelemetrySensorReadMs = 0;
+
+const uint8_t IBUS_CMD_DISCOVER = 0x80;
+const uint8_t IBUS_CMD_TYPE     = 0x90;
+const uint8_t IBUS_CMD_VALUE    = 0xA0;
+
+const uint8_t IBUS_SENSOR_TEMP  = 0x01;
+const uint8_t IBUS_SENSOR_EXTV  = 0x03;
+
 // ---------- POMOCNÉ ----------
 long mapLong(long x, long in_min, long in_max, long out_min, long out_max) {
   if (x < in_min) x = in_min;
@@ -176,6 +192,128 @@ void bezpecneStavy() {
 
   pinMode(STEPPER_EN, OUTPUT);
   digitalWrite(STEPPER_EN, HIGH);
+}
+
+void citajTlakomer() {
+  sensor.read();
+  depth_real = sensor.depth() - depth_offset;
+  temp_real = sensor.temperature();
+}
+
+int16_t ibusTeplota() {
+  return (int16_t)((temp_real + 40.0f) * 10.0f);
+}
+
+int16_t ibusHlbkaAkoNapatie() {
+  float h = depth_real;
+  if (h < 0.0f) h = 0.0f;
+  return (int16_t)(h * 100.0f);
+}
+
+#if ENABLE_IBUS_TELEMETRY
+void ibusWriteChecksum(uint16_t checksum) {
+  Serial.write((uint8_t)(checksum & 0xFF));
+  Serial.write((uint8_t)(checksum >> 8));
+}
+
+void ibusSendDiscover(uint8_t adr) {
+  uint8_t cmd = IBUS_CMD_DISCOVER | adr;
+  Serial.write((uint8_t)0x04);
+  Serial.write(cmd);
+  ibusWriteChecksum(0xFFFF - 0x04 - cmd);
+}
+
+void ibusSendType(uint8_t adr, uint8_t sensorType) {
+  uint8_t cmd = IBUS_CMD_TYPE | adr;
+  uint8_t len = 0x06;
+  uint8_t sensorLen = 0x02;
+  uint16_t checksum = 0xFFFF - len - cmd - sensorType - sensorLen;
+
+  Serial.write(len);
+  Serial.write(cmd);
+  Serial.write(sensorType);
+  Serial.write(sensorLen);
+  ibusWriteChecksum(checksum);
+}
+
+void ibusSendValue(uint8_t adr, int16_t value) {
+  uint8_t cmd = IBUS_CMD_VALUE | adr;
+  uint8_t len = 0x06;
+  uint8_t lo = (uint8_t)(value & 0xFF);
+  uint8_t hi = (uint8_t)((value >> 8) & 0xFF);
+  uint16_t checksum = 0xFFFF - len - cmd - lo - hi;
+
+  Serial.write(len);
+  Serial.write(cmd);
+  Serial.write(lo);
+  Serial.write(hi);
+  ibusWriteChecksum(checksum);
+}
+
+void spracujIbusRequest(uint8_t cmd) {
+  uint8_t adr = cmd & 0x0F;
+  uint8_t command = cmd & 0xF0;
+
+  if (adr < 1 || adr > 2) return;
+
+  if (command == IBUS_CMD_DISCOVER) {
+    ibusSendDiscover(adr);
+  } else if (command == IBUS_CMD_TYPE) {
+    ibusSendType(adr, adr == 1 ? IBUS_SENSOR_TEMP : IBUS_SENSOR_EXTV);
+  } else if (command == IBUS_CMD_VALUE) {
+    ibusSendValue(adr, adr == 1 ? ibusTeplota() : ibusHlbkaAkoNapatie());
+  }
+}
+
+void obsluzIbusTelemetriu() {
+  static uint8_t frame[4];
+  static uint8_t pos = 0;
+  static unsigned long lastByteMs = 0;
+
+  while (Serial.available() > 0) {
+    uint8_t b = (uint8_t)Serial.read();
+    unsigned long nowMs = millis();
+    bool newFrameGap = (lastByteMs == 0) || ((unsigned long)(nowMs - lastByteMs) >= 3);
+
+    if (newFrameGap) {
+      pos = 0;
+    }
+    lastByteMs = nowMs;
+
+    if (pos == 0) {
+      if (!newFrameGap || b != 0x04) {
+        continue;
+      }
+    }
+
+    frame[pos++] = b;
+
+    if (pos >= 4) {
+      pos = 0;
+      uint16_t receivedChecksum = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
+      uint16_t expectedChecksum = 0xFFFF - frame[0] - frame[1];
+
+      if (frame[0] == 0x04 && receivedChecksum == expectedChecksum) {
+        spracujIbusRequest(frame[1]);
+      }
+    }
+  }
+}
+#else
+void obsluzIbusTelemetriu() {
+}
+#endif
+
+void aktualizujSenzorPreTelemetriu() {
+#if ENABLE_IBUS_TELEMETRY
+  if (autoMode) return;
+
+  unsigned long nowMs = millis();
+  if ((unsigned long)(nowMs - lastTelemetrySensorReadMs) >= TELEMETRY_SENSOR_READ_INTERVAL_MS) {
+    lastTelemetrySensorReadMs = nowMs;
+    citajTlakomer();
+  }
+#endif
 }
 
 void nacitajEEPROM() {
@@ -262,8 +400,7 @@ void riadStepperAutoPI() {
   if ((nowMs - lastRegMs) >= (unsigned long)(REG_TS * 1000.0f)) {
     lastRegMs = nowMs;
 
-    sensor.read();
-    depth_real = sensor.depth() - depth_offset;
+    citajTlakomer();
     float e = depth_ref - depth_real;
 
     float abs_e = e;
@@ -305,6 +442,7 @@ void riadStepperAutoPI() {
     }
 
     // debug
+#if !ENABLE_IBUS_TELEMETRY
     if (millis() - lastPrintMs >= 2000) {
       lastPrintMs = millis();
 
@@ -323,6 +461,7 @@ void riadStepperAutoPI() {
       Serial.print(", hold=");
       Serial.println(depthHoldPaused ? 1 : 0);
     }
+#endif
   }
 
   long chyba = ciel_kroky_reg - pozicia_kroky;
@@ -348,6 +487,7 @@ void riadStepperAutoPI() {
 }
 
 void vypisLog() {
+#if !ENABLE_IBUS_TELEMETRY
   long log_magic = 0;
   int count = LOG_COUNT;
   int write_index = 0;
@@ -380,6 +520,7 @@ void vypisLog() {
     Serial.print(h, 4);
   }
   Serial.println();
+#endif
 }
 
 // ---------- STEPPER MANUAL z CH3 ----------
@@ -535,9 +676,13 @@ void aktualizujRezim() {
         sensor.read();
         depth_offset = sensor.depth();
         depth_real = 0.0f;
+        temp_real = sensor.temperature();
+        lastTelemetrySensorReadMs = millis();
         hladinaVynulovana = true;
+#if !ENABLE_IBUS_TELEMETRY
         Serial.print("HLADINA VYNULOVANA, offset=");
         Serial.println(depth_offset, 4);
+#endif
       }
 
       if (rozsahOK) {
@@ -545,9 +690,13 @@ void aktualizujRezim() {
         ciel_kroky_reg = pozicia_kroky;
       }
 
+#if !ENABLE_IBUS_TELEMETRY
       Serial.println("PREPINAM NA AUTO PI");
+#endif
     } else {
+#if !ENABLE_IBUS_TELEMETRY
       Serial.println("PREPINAM NA MANUAL");
+#endif
     }
 
     lastRegMs = millis();
@@ -580,27 +729,35 @@ void setup() {
   Wire.begin();
 
   while (!sensor.init()) {
+#if !ENABLE_IBUS_TELEMETRY
     Serial.println("Init failed!");
+#endif
     delay(2000);
   }
 
   sensor.setModel(MS5837::MS5837_02BA);
   sensor.setFluidDensity(997); // sladká voda
+  citajTlakomer();
+  lastTelemetrySensorReadMs = millis();
 
-  vypisLog();
-  while(1);
+  //vypisLog();
+  //while(1);
 }
 
 void loop() {
+  obsluzIbusTelemetriu();
+
   riadLED();
   riadESCmix();
   aktualizujRezim();
+  obsluzIbusTelemetriu();
 
   if (autoMode) {
     riadStepperAutoPI();
   } else {
     riadStepperManual();
   }
+  obsluzIbusTelemetriu();
 
   if (autoMode && log_active) {
     if (millis() - log_last_ms >= 2000) {
@@ -621,4 +778,7 @@ void loop() {
       EEPROM.put(LOG_WRITE_INDEX_ADDR, log_index);
     }
   }
+
+  aktualizujSenzorPreTelemetriu();
+  obsluzIbusTelemetriu();
 }
