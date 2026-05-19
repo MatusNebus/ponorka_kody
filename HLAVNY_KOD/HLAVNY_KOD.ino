@@ -2,6 +2,7 @@
 #include <Servo.h>
 #include <EEPROM.h>
 #include <Wire.h>
+#include "iBUSTelemetry.h"
 #include "MS5837.h"
 
 MS5837 sensor;
@@ -49,7 +50,7 @@ Servo escL, escR;
 const int ESC_MIN_US      = 1000;
 const int ESC_MID_US      = 1500;
 const int ESC_MAX_US      = 2000;
-const int MRTVA_ZONA_US   = 30;
+const int MRTVA_ZONA_US   = 120;
 const float ESC_SCALE     = 0.30f;
 
 // ---------- LED (CH6) ----------
@@ -95,6 +96,52 @@ const float EXTRA_MAX_STROKE_MM = 5.0f;
 // ---------- PPM ----------
 PPMReader ppm(PPM_PIN, POCET_KANALOV);
 
+struct StabilnyPpmKanal {
+  int hodnota;
+  int kandidat;
+  uint8_t pocetKandidatov;
+  bool inicializovany;
+};
+
+StabilnyPpmKanal ppmCh1 = {1500, 1500, 0, false};
+StabilnyPpmKanal ppmCh2 = {1500, 1500, 0, false};
+StabilnyPpmKanal ppmCh3 = {1500, 1500, 0, false};
+StabilnyPpmKanal ppmCh5 = {1000, 1000, 0, false};
+StabilnyPpmKanal ppmCh6 = {1500, 1500, 0, false};
+
+const int PPM_MIN_PLATNE_US = 900;
+const int PPM_MAX_PLATNE_US = 2100;
+const int PPM_SKOK_ESC_US = 160;
+const int PPM_SKOK_CH3_US = 180;
+const int PPM_SKOK_CH5_US = 250;
+const int PPM_SKOK_CH6_US = 180;
+const int PPM_KANDIDAT_TOLERANCIA_US = 80;
+const uint8_t PPM_POTVRDENIA_ESC = 3;
+const uint8_t PPM_POTVRDENIA_CH3 = 4;
+const uint8_t PPM_POTVRDENIA_CH5 = 4;
+const uint8_t PPM_POTVRDENIA_CH6 = 5;
+
+const unsigned long PPM_ARM_STABLE_MS = 1500;
+const unsigned long PPM_LOST_MS = 300;
+const int PPM_ARM_NEUTRAL_ESC_US = 130;
+const int PPM_ARM_NEUTRAL_CH3_US = 220;
+const long STEPPER_TARGET_DEADBAND_STEPS = 120;
+const unsigned long STEPPER_TARGET_STABLE_MS = 500;
+const unsigned long LED_ON_STABLE_MS = 1000;
+
+bool ppmRiadenieAktivne = false;
+unsigned long ppmSafeOdMs = 0;
+unsigned long ppmLastGoodMs = 0;
+
+int ledPwmAktualny = 255;
+int ledPwmKandidat = 255;
+unsigned long ledKandidatOdMs = 0;
+
+long manualCielKroky = 0;
+long manualKandidatCielKroky = 0;
+unsigned long manualKandidatOdMs = 0;
+bool manualCielInicializovany = false;
+
 // ================================================================
 // PI REGULÁTOR
 // ================================================================
@@ -122,15 +169,21 @@ unsigned long ch5_auto_off_od_ms = 0;
 unsigned long lastPrintMs = 0;
 
 // ---------- iBUS TELEMETRIA ----------
-// 1 = Serial na D0/D1 patri FlySky iBUS telemetrii.
+// 1 = iBUS telemetria cez softverovy half-duplex pin IBUS_TELEMETRY_PIN.
 // 0 = Serial Monitor/debug/log vypisy cez USB.
 #define ENABLE_IBUS_TELEMETRY 1
 #define IBUS_USE_DUMMY_VALUES 1
+#define IBUS_TELEMETRY_PIN 11
+
+#if ENABLE_IBUS_TELEMETRY
+iBUSTelemetry IBusTelemetry(IBUS_TELEMETRY_PIN);
+bool ibusWindowActive = false;
+#endif
 
 const unsigned long TELEMETRY_SENSOR_READ_INTERVAL_MS = 1000;
 unsigned long lastTelemetrySensorReadMs = 0;
-const uint8_t IBUS_MAX_BYTES_PER_CALL = 16;
-const unsigned long IBUS_FRAME_GAP_US = 3000;
+const unsigned long IBUS_WINDOW_PERIOD_MS = 1000;
+const unsigned long IBUS_WINDOW_ACTIVE_MS = 120;
 
 const uint8_t IBUS_CMD_DISCOVER = 0x80;
 const uint8_t IBUS_CMD_TYPE     = 0x90;
@@ -151,6 +204,181 @@ int deadband1500(int us, int db) {
   if (us < ESC_MIN_US) return ESC_MIN_US;
   if (us > ESC_MAX_US) return ESC_MAX_US;
   return us;
+}
+
+bool ppmHodnotaPlatna(int v) {
+  return v >= PPM_MIN_PLATNE_US && v <= PPM_MAX_PLATNE_US;
+}
+
+int citajPpmRaw(uint8_t kanal) {
+  return ppm.latestValidChannelValue(kanal, 0);
+}
+
+void nastavBezpecneVystupy() {
+  analogWrite(LED_PIN_PWM, 255);
+  ledPwmAktualny = 255;
+  ledPwmKandidat = 255;
+  ledKandidatOdMs = 0;
+  escL.writeMicroseconds(ESC_MID_US);
+  escR.writeMicroseconds(ESC_MID_US);
+  stepperEnable(false);
+}
+
+bool ppmSignalPlatnyTeraz() {
+  int ch1 = citajPpmRaw(1);
+  int ch2 = citajPpmRaw(2);
+  int ch3 = citajPpmRaw(3);
+  int ch5 = citajPpmRaw(5);
+  int ch6 = citajPpmRaw(6);
+
+  return ppmHodnotaPlatna(ch1) &&
+         ppmHodnotaPlatna(ch2) &&
+         ppmHodnotaPlatna(ch3) &&
+         ppmHodnotaPlatna(ch5) &&
+         ppmHodnotaPlatna(ch6);
+}
+
+bool ppmBezpecneNaZapnutieRiadenia() {
+  int ch1 = citajPpmRaw(1);
+  int ch2 = citajPpmRaw(2);
+  int ch3 = citajPpmRaw(3);
+  int ch5 = citajPpmRaw(5);
+
+  if (!ppmSignalPlatnyTeraz()) return false;
+  if (abs(ch1 - ESC_MID_US) > PPM_ARM_NEUTRAL_ESC_US) return false;
+  if (abs(ch2 - ESC_MID_US) > PPM_ARM_NEUTRAL_ESC_US) return false;
+  if (abs(ch3 - ESC_MID_US) > PPM_ARM_NEUTRAL_CH3_US) return false;
+  if (ch5 >= CH5_AUTO_MIN) return false;
+
+  return true;
+}
+
+void aktualizujPpmBezpecnost() {
+  unsigned long nowMs = millis();
+
+  if (ppmSignalPlatnyTeraz()) {
+    ppmLastGoodMs = nowMs;
+  }
+
+  if (!ppmRiadenieAktivne) {
+    if (ppmBezpecneNaZapnutieRiadenia()) {
+      if (ppmSafeOdMs == 0) ppmSafeOdMs = nowMs;
+      if ((unsigned long)(nowMs - ppmSafeOdMs) >= PPM_ARM_STABLE_MS) {
+        ppmRiadenieAktivne = true;
+      }
+    } else {
+      ppmSafeOdMs = 0;
+    }
+    return;
+  }
+
+  if ((unsigned long)(nowMs - ppmLastGoodMs) > PPM_LOST_MS) {
+    ppmRiadenieAktivne = false;
+    ppmSafeOdMs = 0;
+    autoMode = false;
+    lastAutoMode = false;
+    nastavBezpecneVystupy();
+  }
+}
+
+int citajPpmStabilne(uint8_t kanal, int fallback, StabilnyPpmKanal &stav, int maxSkokUs, uint8_t potrebnePotvrdenia) {
+  int v = ppm.latestValidChannelValue(kanal, fallback);
+
+  if (v < PPM_MIN_PLATNE_US || v > PPM_MAX_PLATNE_US) {
+    return stav.inicializovany ? stav.hodnota : fallback;
+  }
+
+  if (!stav.inicializovany) {
+    stav.hodnota = v;
+    stav.kandidat = v;
+    stav.pocetKandidatov = 0;
+    stav.inicializovany = true;
+    return stav.hodnota;
+  }
+
+  if (abs(v - stav.hodnota) <= maxSkokUs) {
+    stav.hodnota = v;
+    stav.kandidat = v;
+    stav.pocetKandidatov = 0;
+    return stav.hodnota;
+  }
+
+  if (abs(v - stav.kandidat) <= PPM_KANDIDAT_TOLERANCIA_US) {
+    if (stav.pocetKandidatov < 255) stav.pocetKandidatov++;
+  } else {
+    stav.kandidat = v;
+    stav.pocetKandidatov = 1;
+  }
+
+  if (stav.pocetKandidatov >= potrebnePotvrdenia) {
+    stav.hodnota = stav.kandidat;
+    stav.pocetKandidatov = 0;
+  }
+
+  return stav.hodnota;
+}
+
+void nastavLedSOneskorenim(int cielPwm) {
+  unsigned long nowMs = millis();
+
+  if (cielPwm == 255) {
+    if (ledPwmAktualny != 255) {
+      analogWrite(LED_PIN_PWM, 255);
+    }
+    ledPwmAktualny = 255;
+    ledPwmKandidat = 255;
+    ledKandidatOdMs = 0;
+    return;
+  }
+
+  if (cielPwm == ledPwmAktualny) {
+    ledPwmKandidat = cielPwm;
+    ledKandidatOdMs = 0;
+    return;
+  }
+
+  if (cielPwm != ledPwmKandidat) {
+    ledPwmKandidat = cielPwm;
+    ledKandidatOdMs = nowMs;
+    return;
+  }
+
+  if (ledKandidatOdMs != 0 && (unsigned long)(nowMs - ledKandidatOdMs) >= LED_ON_STABLE_MS) {
+    analogWrite(LED_PIN_PWM, cielPwm);
+    ledPwmAktualny = cielPwm;
+    ledKandidatOdMs = 0;
+  }
+}
+
+long stabilizujManualnyCiel(long ciel) {
+  unsigned long nowMs = millis();
+
+  if (!manualCielInicializovany) {
+    manualCielKroky = ciel;
+    manualKandidatCielKroky = ciel;
+    manualKandidatOdMs = 0;
+    manualCielInicializovany = true;
+    return manualCielKroky;
+  }
+
+  if (abs(ciel - manualCielKroky) <= STEPPER_TARGET_DEADBAND_STEPS) {
+    manualKandidatCielKroky = manualCielKroky;
+    manualKandidatOdMs = 0;
+    return manualCielKroky;
+  }
+
+  if (abs(ciel - manualKandidatCielKroky) > STEPPER_TARGET_DEADBAND_STEPS) {
+    manualKandidatCielKroky = ciel;
+    manualKandidatOdMs = nowMs;
+    return manualCielKroky;
+  }
+
+  if (manualKandidatOdMs != 0 && (unsigned long)(nowMs - manualKandidatOdMs) >= STEPPER_TARGET_STABLE_MS) {
+    manualCielKroky = manualKandidatCielKroky;
+    manualKandidatOdMs = 0;
+  }
+
+  return manualCielKroky;
 }
 
 void stepperEnable(bool enableOn) {
@@ -203,133 +431,50 @@ void citajTlakomer() {
   temp_real = sensor.temperature();
 }
 
-int16_t ibusTeplota() {
+float ibusTeplotaC() {
 #if IBUS_USE_DUMMY_VALUES
-  return (int16_t)((22.5f + 40.0f) * 10.0f);
+  return 22.5f;
 #else
-  return (int16_t)((temp_real + 40.0f) * 10.0f);
+  return temp_real;
 #endif
 }
 
-int16_t ibusHlbkaAkoNapatie() {
+float ibusHlbkaM() {
 #if IBUS_USE_DUMMY_VALUES
-  return (int16_t)(0.42f * 100.0f);
+  return 0.42f;
 #else
   float h = depth_real;
   if (h < 0.0f) h = 0.0f;
-  return (int16_t)(h * 100.0f);
+  return h;
 #endif
 }
 
+void aktualizujIbusCache() {
 #if ENABLE_IBUS_TELEMETRY
-void ibusAfterResponse() {
-  Serial.flush();
-
-  while (Serial.available() > 0) {
-    Serial.read();
-  }
-}
-
-void ibusWriteChecksum(uint16_t checksum) {
-  Serial.write((uint8_t)(checksum & 0xFF));
-  Serial.write((uint8_t)(checksum >> 8));
-}
-
-void ibusSendDiscover(uint8_t adr) {
-  uint8_t cmd = IBUS_CMD_DISCOVER | adr;
-  Serial.write((uint8_t)0x04);
-  Serial.write(cmd);
-  ibusWriteChecksum(0xFFFF - 0x04 - cmd);
-  ibusAfterResponse();
-}
-
-void ibusSendType(uint8_t adr, uint8_t sensorType) {
-  uint8_t cmd = IBUS_CMD_TYPE | adr;
-  uint8_t len = 0x06;
-  uint8_t sensorLen = 0x02;
-  uint16_t checksum = 0xFFFF - len - cmd - sensorType - sensorLen;
-
-  Serial.write(len);
-  Serial.write(cmd);
-  Serial.write(sensorType);
-  Serial.write(sensorLen);
-  ibusWriteChecksum(checksum);
-  ibusAfterResponse();
-}
-
-void ibusSendValue(uint8_t adr, int16_t value) {
-  uint8_t cmd = IBUS_CMD_VALUE | adr;
-  uint8_t len = 0x06;
-  uint8_t lo = (uint8_t)(value & 0xFF);
-  uint8_t hi = (uint8_t)((value >> 8) & 0xFF);
-  uint16_t checksum = 0xFFFF - len - cmd - lo - hi;
-
-  Serial.write(len);
-  Serial.write(cmd);
-  Serial.write(lo);
-  Serial.write(hi);
-  ibusWriteChecksum(checksum);
-  ibusAfterResponse();
-}
-
-void spracujIbusRequest(uint8_t cmd) {
-  uint8_t adr = cmd & 0x0F;
-  uint8_t command = cmd & 0xF0;
-
-  if (adr < 1 || adr > 2) return;
-
-  if (command == IBUS_CMD_DISCOVER) {
-    ibusSendDiscover(adr);
-  } else if (command == IBUS_CMD_TYPE) {
-    ibusSendType(adr, adr == 1 ? IBUS_SENSOR_TEMP : IBUS_SENSOR_EXTV);
-  } else if (command == IBUS_CMD_VALUE) {
-    ibusSendValue(adr, adr == 1 ? ibusTeplota() : ibusHlbkaAkoNapatie());
-  }
-}
-
-void obsluzIbusTelemetriu() {
-  static uint8_t frame[4];
-  static uint8_t pos = 0;
-  static unsigned long lastByteUs = 0;
-  uint8_t processed = 0;
-
-  while (Serial.available() > 0 && processed < IBUS_MAX_BYTES_PER_CALL) {
-    processed++;
-    uint8_t b = (uint8_t)Serial.read();
-    unsigned long nowUs = micros();
-    bool newFrameGap = (lastByteUs == 0) || ((unsigned long)(nowUs - lastByteUs) >= IBUS_FRAME_GAP_US);
-
-    if (newFrameGap) {
-      pos = 0;
-    }
-    lastByteUs = nowUs;
-
-    if (pos == 0) {
-      if (!newFrameGap || b != 0x04) {
-        pos = 0;
-        continue;
-      }
-    }
-
-    frame[pos++] = b;
-
-    if (pos >= 4) {
-      pos = 0;
-      uint16_t receivedChecksum = (uint16_t)frame[2] | ((uint16_t)frame[3] << 8);
-      uint16_t expectedChecksum = 0xFFFF - frame[0] - frame[1];
-
-      if (frame[0] == 0x04 && receivedChecksum == expectedChecksum) {
-        spracujIbusRequest(frame[1]);
-      } else {
-        pos = 0;
-      }
-    }
-  }
-}
-#else
-void obsluzIbusTelemetriu() {
-}
+  IBusTelemetry.setSensorValueFP(1, ibusTeplotaC());
+  IBusTelemetry.setSensorValueFP(2, ibusHlbkaM());
 #endif
+}
+
+void obsluzIbusTelemetriu() {
+#if ENABLE_IBUS_TELEMETRY
+  unsigned long phase = millis() % IBUS_WINDOW_PERIOD_MS;
+  bool shouldBeActive = phase < IBUS_WINDOW_ACTIVE_MS;
+
+  if (shouldBeActive && !ibusWindowActive) {
+    IBusTelemetry.flush();
+    IBusTelemetry.listen();
+    ibusWindowActive = true;
+  } else if (!shouldBeActive && ibusWindowActive) {
+    IBusTelemetry.stopListening();
+    ibusWindowActive = false;
+  }
+
+  if (ibusWindowActive) {
+    IBusTelemetry.run();
+  }
+#endif
+}
 
 void aktualizujSenzorPreTelemetriu() {
 #if ENABLE_IBUS_TELEMETRY
@@ -338,7 +483,12 @@ void aktualizujSenzorPreTelemetriu() {
   unsigned long nowMs = millis();
   if ((unsigned long)(nowMs - lastTelemetrySensorReadMs) >= TELEMETRY_SENSOR_READ_INTERVAL_MS) {
     lastTelemetrySensorReadMs = nowMs;
+#if IBUS_USE_DUMMY_VALUES
+    aktualizujIbusCache();
+#else
     citajTlakomer();
+    aktualizujIbusCache();
+#endif
   }
 #endif
 }
@@ -377,21 +527,26 @@ int filterCH3(int input) {
 
 // ---------- LED z CH6 ----------
 void riadLED() {
-  int ch6 = ppm.latestValidChannelValue(6, 1500);
+  int ch6 = citajPpmStabilne(6, 1500, ppmCh6, PPM_SKOK_CH6_US, PPM_POTVRDENIA_CH6);
+  int cielPwm = 255;
 
   if (ch6 <= CH6_OFF_MAX) {
-    analogWrite(LED_PIN_PWM, 255);
+    cielPwm = 255;
   } else if (ch6 <= CH6_MID_MAX) {
-    analogWrite(LED_PIN_PWM, 128);
+    cielPwm = 128;
   } else {
-    analogWrite(LED_PIN_PWM, 0);
+    cielPwm = 0;
   }
+
+  nastavLedSOneskorenim(cielPwm);
 }
 
 // ---------- MIX pre 2 ESC ----------
 void riadESCmix() {
-  int ch1 = deadband1500(ppm.latestValidChannelValue(1, ESC_MID_US), MRTVA_ZONA_US);
-  int ch2 = deadband1500(ppm.latestValidChannelValue(2, ESC_MID_US), MRTVA_ZONA_US);
+  int ch1 = citajPpmStabilne(1, ESC_MID_US, ppmCh1, PPM_SKOK_ESC_US, PPM_POTVRDENIA_ESC);
+  int ch2 = citajPpmStabilne(2, ESC_MID_US, ppmCh2, PPM_SKOK_ESC_US, PPM_POTVRDENIA_ESC);
+  ch1 = deadband1500(ch1, MRTVA_ZONA_US);
+  ch2 = deadband1500(ch2, MRTVA_ZONA_US);
 
   int turn = ch1 - ESC_MID_US;
   int thr  = ch2 - ESC_MID_US;
@@ -428,6 +583,7 @@ void riadStepperAutoPI() {
     lastRegMs = nowMs;
 
     citajTlakomer();
+    aktualizujIbusCache();
     float e = depth_ref - depth_real;
 
     float abs_e = e;
@@ -552,7 +708,7 @@ void vypisLog() {
 
 // ---------- STEPPER MANUAL z CH3 ----------
 void riadStepperManual() {
-  ch3_raw = ppm.latestValidChannelValue(3, 1500);
+  ch3_raw = citajPpmStabilne(3, 1500, ppmCh3, PPM_SKOK_CH3_US, PPM_POTVRDENIA_CH3);
   if (ch3_raw < 1000) ch3_raw = 1000;
   if (ch3_raw > 2000) ch3_raw = 2000;
 
@@ -583,6 +739,7 @@ void riadStepperManual() {
   }
 
   if (!zosuladene) {
+    manualCielInicializovany = false;
     if (ch3 <= 1300) {
       if (ch3_dole_od_ms == 0) ch3_dole_od_ms = teraz_ms;
       ch3_hore_od_ms = 0;
@@ -629,10 +786,11 @@ void riadStepperManual() {
 
   if (ciel < min_kroky) ciel = min_kroky;
   if (ciel > max_kroky) ciel = max_kroky;
+  ciel = stabilizujManualnyCiel(ciel);
 
   long chyba = ciel - pozicia_kroky;
 
-  if (chyba == 0) {
+  if (abs(chyba) <= STEPPER_TARGET_DEADBAND_STEPS) {
     stepperEnable(false);
     return;
   }
@@ -649,7 +807,7 @@ void riadStepperManual() {
 // REŽIM AUTO / MANUAL
 // ================================================================
 void aktualizujRezim() {
-  int ch5 = ppm.latestValidChannelValue(5, 1000);
+  int ch5 = citajPpmStabilne(5, 1000, ppmCh5, PPM_SKOK_CH5_US, PPM_POTVRDENIA_CH5);
   unsigned long nowMs = millis();
 
   // 🔴 hysterézia (dve hranice)
@@ -706,6 +864,7 @@ void aktualizujRezim() {
         temp_real = sensor.temperature();
         lastTelemetrySensorReadMs = millis();
         hladinaVynulovana = true;
+        aktualizujIbusCache();
 #if !ENABLE_IBUS_TELEMETRY
         Serial.print("HLADINA VYNULOVANA, offset=");
         Serial.println(depth_offset, 4);
@@ -733,7 +892,9 @@ void aktualizujRezim() {
 
 // ================== SETUP / LOOP ==================
 void setup() {
+#if !ENABLE_IBUS_TELEMETRY
   Serial.begin(115200);
+#endif
 
   bezpecneStavy();
   nacitajEEPROM();
@@ -755,6 +916,7 @@ void setup() {
 
   Wire.begin();
 
+#if !IBUS_USE_DUMMY_VALUES
   while (!sensor.init()) {
 #if !ENABLE_IBUS_TELEMETRY
     Serial.println("Init failed!");
@@ -765,14 +927,34 @@ void setup() {
   sensor.setModel(MS5837::MS5837_02BA);
   sensor.setFluidDensity(997); // sladká voda
   citajTlakomer();
+#else
+  depth_real = 0.0f;
+  temp_real = 22.5f;
+#endif
   lastTelemetrySensorReadMs = millis();
+
+#if ENABLE_IBUS_TELEMETRY
+  IBusTelemetry.begin();
+  IBusTelemetry.addSensor(IBUS_MEAS_TYPE_TEM);
+  IBusTelemetry.addSensor(IBUS_MEAS_TYPE_EXTV);
+  aktualizujIbusCache();
+  IBusTelemetry.stopListening();
+  ibusWindowActive = false;
+#endif
 
   //vypisLog();
   //while(1);
 }
 
 void loop() {
-  obsluzIbusTelemetriu();
+  aktualizujPpmBezpecnost();
+
+  if (!ppmRiadenieAktivne) {
+    nastavBezpecneVystupy();
+    aktualizujSenzorPreTelemetriu();
+    obsluzIbusTelemetriu();
+    return;
+  }
 
   riadLED();
   riadESCmix();
