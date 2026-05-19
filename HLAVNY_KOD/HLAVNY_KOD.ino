@@ -27,6 +27,8 @@ bool hladinaVynulovana = false;
 #define ESC_LEFT_PIN     9
 #define ESC_RIGHT_PIN    6
 
+#define IBUS_TELEMETRY_PIN 11  // main nepouziva iBUS, ale SENS je fyzicky zapojeny na D11
+
 // ---------- LOGOVANIE ----------
 const int LOG_MAGIC_ADDR = 88;
 const int LOG_COUNT_ADDR = 92;
@@ -160,6 +162,8 @@ bool jeCasNaKrok(unsigned long teraz_us) {
 }
 
 void bezpecneStavy() {
+  pinMode(IBUS_TELEMETRY_PIN, INPUT_PULLUP);
+
   pinMode(LED_PIN_PWM, OUTPUT);
   analogWrite(LED_PIN_PWM, 255);
 
