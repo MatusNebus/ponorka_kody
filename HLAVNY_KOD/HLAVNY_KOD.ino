@@ -50,7 +50,7 @@ Servo escL, escR;
 const int ESC_MIN_US      = 1000;
 const int ESC_MID_US      = 1500;
 const int ESC_MAX_US      = 2000;
-const int MRTVA_ZONA_US   = 120;
+const int MRTVA_ZONA_US   = 50;
 const float ESC_SCALE     = 0.30f;
 
 // ---------- LED (CH6) ----------
@@ -103,20 +103,29 @@ struct StabilnyPpmKanal {
   bool inicializovany;
 };
 
+struct StabilnyEscKanal {
+  int hodnota;
+  int kandidat;
+  unsigned long kandidatOdMs;
+  bool inicializovany;
+};
+
 StabilnyPpmKanal ppmCh1 = {1500, 1500, 0, false};
 StabilnyPpmKanal ppmCh2 = {1500, 1500, 0, false};
 StabilnyPpmKanal ppmCh3 = {1500, 1500, 0, false};
 StabilnyPpmKanal ppmCh5 = {1000, 1000, 0, false};
 StabilnyPpmKanal ppmCh6 = {1500, 1500, 0, false};
+StabilnyEscKanal escCh1 = {1500, 1500, 0, false};
+StabilnyEscKanal escCh2 = {1500, 1500, 0, false};
 
 const int PPM_MIN_PLATNE_US = 900;
 const int PPM_MAX_PLATNE_US = 2100;
-const int PPM_SKOK_ESC_US = 160;
+const int PPM_SKOK_ESC_US = 300;
 const int PPM_SKOK_CH3_US = 180;
 const int PPM_SKOK_CH5_US = 250;
 const int PPM_SKOK_CH6_US = 180;
 const int PPM_KANDIDAT_TOLERANCIA_US = 80;
-const uint8_t PPM_POTVRDENIA_ESC = 3;
+const uint8_t PPM_POTVRDENIA_ESC = 2;
 const uint8_t PPM_POTVRDENIA_CH3 = 4;
 const uint8_t PPM_POTVRDENIA_CH5 = 4;
 const uint8_t PPM_POTVRDENIA_CH6 = 5;
@@ -125,8 +134,10 @@ const unsigned long PPM_ARM_STABLE_MS = 1500;
 const unsigned long PPM_LOST_MS = 300;
 const int PPM_ARM_NEUTRAL_ESC_US = 130;
 const int PPM_ARM_NEUTRAL_CH3_US = 220;
-const long STEPPER_TARGET_DEADBAND_STEPS = 120;
+const long STEPPER_TARGET_DEADBAND_STEPS = 15;
 const unsigned long STEPPER_TARGET_STABLE_MS = 500;
+const unsigned long ESC_TARGET_STABLE_MS = 100;
+const int ESC_TARGET_TOLERANCE_US = 8;
 const unsigned long LED_ON_STABLE_MS = 1000;
 
 bool ppmRiadenieAktivne = false;
@@ -381,6 +392,37 @@ long stabilizujManualnyCiel(long ciel) {
   return manualCielKroky;
 }
 
+int stabilizujEscKanal(int ciel, StabilnyEscKanal &stav) {
+  unsigned long nowMs = millis();
+
+  if (!stav.inicializovany) {
+    stav.hodnota = ciel;
+    stav.kandidat = ciel;
+    stav.kandidatOdMs = 0;
+    stav.inicializovany = true;
+    return stav.hodnota;
+  }
+
+  if (abs(ciel - stav.hodnota) <= ESC_TARGET_TOLERANCE_US) {
+    stav.kandidat = stav.hodnota;
+    stav.kandidatOdMs = 0;
+    return stav.hodnota;
+  }
+
+  if (abs(ciel - stav.kandidat) > ESC_TARGET_TOLERANCE_US) {
+    stav.kandidat = ciel;
+    stav.kandidatOdMs = nowMs;
+    return stav.hodnota;
+  }
+
+  if (stav.kandidatOdMs != 0 && (unsigned long)(nowMs - stav.kandidatOdMs) >= ESC_TARGET_STABLE_MS) {
+    stav.hodnota = stav.kandidat;
+    stav.kandidatOdMs = 0;
+  }
+
+  return stav.hodnota;
+}
+
 void stepperEnable(bool enableOn) {
   digitalWrite(STEPPER_EN, enableOn ? LOW : HIGH); // LOW = enable
 }
@@ -547,6 +589,8 @@ void riadESCmix() {
   int ch2 = citajPpmStabilne(2, ESC_MID_US, ppmCh2, PPM_SKOK_ESC_US, PPM_POTVRDENIA_ESC);
   ch1 = deadband1500(ch1, MRTVA_ZONA_US);
   ch2 = deadband1500(ch2, MRTVA_ZONA_US);
+  ch1 = stabilizujEscKanal(ch1, escCh1);
+  ch2 = stabilizujEscKanal(ch2, escCh2);
 
   int turn = ch1 - ESC_MID_US;
   int thr  = ch2 - ESC_MID_US;
