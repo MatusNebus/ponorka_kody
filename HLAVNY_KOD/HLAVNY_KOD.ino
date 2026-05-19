@@ -183,7 +183,7 @@ unsigned long lastPrintMs = 0;
 // 1 = iBUS telemetria cez softverovy half-duplex pin IBUS_TELEMETRY_PIN.
 // 0 = Serial Monitor/debug/log vypisy cez USB.
 #define ENABLE_IBUS_TELEMETRY 1
-#define IBUS_USE_DUMMY_VALUES 1
+#define IBUS_USE_DUMMY_VALUES 0
 #define IBUS_TELEMETRY_PIN 11
 
 #if ENABLE_IBUS_TELEMETRY
