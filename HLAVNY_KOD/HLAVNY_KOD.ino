@@ -7,8 +7,9 @@
 MS5837 sensor;
 float depth_real = 0.0f;
 float depth_offset = 0.0f;
+float temp_real = 0.0f;
 bool hladinaVynulovana = false;
-//temp znac
+//temp znac   
 // ================================================================
 // ROV – ALL-IN-ONE
 // CH5 LOW  = manual stepper cez CH3
@@ -35,6 +36,7 @@ const int LOG_COUNT_ADDR = 92;
 const int LOG_WRITE_INDEX_ADDR = 96;
 const int LOG_START_ADDR = 100;   // kde začneme ukladať
 const int LOG_COUNT = 100;        // 200 s / 2 s = 100 vzoriek
+const int LOG_TEMP_START_ADDR = LOG_START_ADDR + LOG_COUNT * (int)sizeof(float);
 const long LOG_MAGIC = 0x31474F4CL;
 
 int log_index = 0;
@@ -97,7 +99,7 @@ PPMReader ppm(PPM_PIN, POCET_KANALOV);
 const float Kp_steps = 1.20f; // cast rozsahu piestu na 1 m chyby
 const float Ki_steps = 0.025f; // cast rozsahu piestu na 1 m*s integralnej chyby
 
-const float depth_ref = 0.35f;        //ZELANA HLBKA oooooooooooooooooooooooooooooooooooooooooooo
+const float depth_ref = 0.3f;        //ZELANA HLBKA oooooooooooooooooooooooooooooooooooooooooooo
 const float REG_TS    = 0.10f;     // 100 ms
 const float DEADBAND_DEPTH = 0.01f; // 1 cm
 const float DEADBAND_EXIT_DEPTH = 0.02f; // znovu reguluj az za 2 cm
@@ -175,6 +177,12 @@ void bezpecneStavy() {
 
   pinMode(STEPPER_EN, OUTPUT);
   digitalWrite(STEPPER_EN, HIGH);
+}
+
+void citajTlakomer() {
+  sensor.read();
+  depth_real = sensor.depth() - depth_offset;
+  temp_real = sensor.temperature();
 }
 
 void nacitajEEPROM() {
@@ -257,8 +265,7 @@ void riadStepperAutoPI() {
   if ((nowMs - lastRegMs) >= (unsigned long)(REG_TS * 1000.0f)) {
     lastRegMs = nowMs;
 
-    sensor.read();
-    depth_real = sensor.depth() - depth_offset;
+    citajTlakomer();
     float e = depth_ref - depth_real;
 
     float abs_e = e;
@@ -373,6 +380,25 @@ void vypisLog() {
       Serial.print(",");
     }
     Serial.print(h, 4);
+  }
+  Serial.println();
+
+  Serial.println("---- TEPLOTA ----");
+  Serial.print("POCET=");
+  Serial.println(count);
+
+  for (int i = 0; i < count; i++) {
+    int eeprom_index = i;
+    if (count == LOG_COUNT) {
+      eeprom_index = (write_index + i) % LOG_COUNT;
+    }
+
+    float t;
+    EEPROM.get(LOG_TEMP_START_ADDR + eeprom_index * sizeof(float), t);
+    if (i > 0) {
+      Serial.print(",");
+    }
+    Serial.print(t, 4);
   }
   Serial.println();
 }
@@ -530,6 +556,7 @@ void aktualizujRezim() {
         sensor.read();
         depth_offset = sensor.depth();
         depth_real = 0.0f;
+        temp_real = sensor.temperature();
         hladinaVynulovana = true;
         Serial.print("HLADINA VYNULOVANA, offset=");
         Serial.println(depth_offset, 4);
@@ -577,13 +604,14 @@ void setup() {
   while (!sensor.init()) {
     Serial.println("Init failed!");
     delay(2000);
-  }
+  } 
 
   sensor.setModel(MS5837::MS5837_02BA);
   sensor.setFluidDensity(997); // sladká voda
+  citajTlakomer();
 
-  //vypisLog();
-  //while(1);
+  vypisLog();
+  while(1);
 }
 
 void loop() {
@@ -602,6 +630,7 @@ void loop() {
       log_last_ms = millis();
 
       EEPROM.put(LOG_START_ADDR + log_index * sizeof(float), depth_real);
+      EEPROM.put(LOG_TEMP_START_ADDR + log_index * sizeof(float), temp_real);
 
       log_index++;
       if (log_index >= LOG_COUNT) {
